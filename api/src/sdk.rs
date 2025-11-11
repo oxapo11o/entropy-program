@@ -31,8 +31,8 @@ pub fn open(
         ],
         data: Open {
             id: id.to_le_bytes(),
-            is_auto: (is_auto as u64).to_le_bytes(),
             commit,
+            is_auto: (is_auto as u64).to_le_bytes(),
             samples: samples.to_le_bytes(),
             end_at: end_at.to_le_bytes(),
         }

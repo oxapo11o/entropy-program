@@ -21,7 +21,7 @@ pub fn process_instruction(
     let (ix, data) = parse_instruction(&entropy_api::ID, program_id, data)?;
 
     match ix {
-        // EntropyInstruction::Open => process_open(accounts, data)?,
+        EntropyInstruction::Open => process_open(accounts, data)?,
         EntropyInstruction::Close => process_close(accounts, data)?,
         EntropyInstruction::Next => process_next(accounts, data)?,
         EntropyInstruction::Reveal => process_reveal(accounts, data)?,

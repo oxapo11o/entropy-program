@@ -1,3 +1,5 @@
+This fork allows for opening of new variables
+
 # Entropy [WIP]
 
 **Entropy** is a provably-fair random number generation protocol for Solana. It uses an commit-reveal scheme paired with slothash sampling strategy to generate random numbers onchain in a secure and cost-effective way.
@@ -8,16 +10,17 @@ To create a new varaible, users must ping the Entropy API offchain and get a sig
 
 The variable will be initialized with the commit provided by the Entropy API and the ending slot provided by the user. When that slot comes due, users should call `Sample` to sample the slothash from the chain and record it to the variable account. Only after the slothash has been sampled, the Entropy API will make the seed value available via a read interface. Users can fetch this value and submit it via the `Reveal` instruction to create the finalized variable value for end use. If the variable is initialized with `is_auto = true`, then the Entropy provider will automatically sample the slothash and reveal the seed without manual user action. After finalization, the variable can be read by any program via `value` property on the account.
 
-The variable will then wait for the user to call `Next` to reset the variable for its next value. The slothash and finalized value will be reset to zero, and the recorded seed from the last value will become the commit for the next value. In this way, the Entropy API is "locked in" to all future seeds and cannot selectively manipulate specific outcomes. Likewise, the slothosh sampled at the ending slot is unknown to the Entropy API at the time of opening the variable, and thus the Entropy provider cannot know the results of future outcomes. Since the Entropy provider keeps future seed values secret until reveal, validators who provide the slothashes cannot favorably manipulate the outcome of the result either. Thus, as long as the Entropy API keeps its seed values secret (and does *not* run a Solana validator), the finalized variable values cannot be known to any party.
-
+The variable will then wait for the user to call `Next` to reset the variable for its next value. The slothash and finalized value will be reset to zero, and the recorded seed from the last value will become the commit for the next value. In this way, the Entropy API is "locked in" to all future seeds and cannot selectively manipulate specific outcomes. Likewise, the slothosh sampled at the ending slot is unknown to the Entropy API at the time of opening the variable, and thus the Entropy provider cannot know the results of future outcomes. Since the Entropy provider keeps future seed values secret until reveal, validators who provide the slothashes cannot favorably manipulate the outcome of the result either. Thus, as long as the Entropy API keeps its seed values secret (and does _not_ run a Solana validator), the finalized variable values cannot be known to any party.
 
 ## API
+
 - [`Consts`](api/src/consts.rs) – Program constants.
 - [`Error`](api/src/error.rs) – Custom program errors.
 - [`Event`](api/src/event.rs) – Custom program events.
 - [`Instruction`](api/src/instruction.rs) – Declared instructions.
 
 ## Instructions
+
 - [`Open`](program/src/open.rs) – Opens a new variable.
 - [`Close`](program/src/close.rs) – Closes a variable account.
 - [`Next`](program/src/next.rs) - Moves a variable to the next value.
@@ -25,16 +28,39 @@ The variable will then wait for the user to call `Next` to reset the variable fo
 - [`Sample`](program/src/sample.rs) - Samples the slothash.
 
 ## State
+
 - [`Variable`](api/src/state/variable.rs) – Variable tracks a unique random variable.
 
 ## Get started
 
 Compile your program:
+
 ```sh
 steel build
 ```
 
 Run unit and integration tests:
+
 ```sh
 steel test
+```
+
+Deploy your program:
+
+```sh
+solana program deploy --program-id wallets/entropy-program.json --url $RPC_URL target/deploy/entropy_program.so
+```
+
+Open a new variable:
+
+```sh
+cargo build -p entropy-cli --release
+
+./target/release/entropy-cli -- \
+  --keypair /workspace/wallets/devdWXWewg5H5z5qH7ADyehvV3sRx7bwV2xtU62b3ew.json open \
+  --id 2 \
+  --commit-hex 5cd2f2e11fdf4c23d568f81f30ad28a1f8912d562e77c0963cf20a2721a19b9e \
+  --samples 999 \
+  --end-offset 150 \
+  --provider apicJTEtH3Q5negrbPKaTfw8at6TmeAo2qW7v8aese1
 ```

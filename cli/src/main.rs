@@ -1,5 +1,6 @@
 use std::str::FromStr;
 
+use clap::{Parser, Subcommand};
 use entropy_api::prelude::*;
 use solana_account_decoder::UiAccountEncoding;
 use solana_client::{
@@ -22,43 +23,173 @@ use solana_sdk::{
 use solana_sdk::{keccak, pubkey};
 use steel::{AccountDeserialize, Clock, Discriminator, Instruction};
 
-const ENTROPY_PROVIDER: Pubkey = pubkey!("AKBXJ7jQ2DiqLQKzgPn791r1ZVNvLchTFH6kpesPAAWF");
+const ENTROPY_PROVIDER: Pubkey = pubkey!("apicJTEtH3Q5negrbPKaTfw8at6TmeAo2qW7v8aese1");
+
+#[derive(Parser)]
+#[command(name = "entropy-cli")]
+#[command(about = "CLI tool for interacting with Entropy protocol", long_about = None)]
+struct Cli {
+    /// Path to the keypair file
+    #[arg(short, long, env = "KEYPAIR")]
+    keypair: String,
+
+    /// RPC endpoint URL
+    #[arg(short, long, env = "RPC")]
+    rpc: String,
+
+    /// Entropy provider base URL
+    #[arg(long, env = "ENTROPY_PROVIDER_URL")]
+    provider_url: String,
+
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    /// Open a new VAR (Verifiable Autonomous Randomness) account
+    Open {
+        /// The ID for the VAR account
+        #[arg(short, long)]
+        id: u64,
+        /// Commit hex string returned by provider's /open (e.g. e9a1cd66...)
+        #[arg(long)]
+        commit_hex: Option<String>,
+        /// Total samples returned by provider's /open
+        #[arg(long)]
+        samples: Option<u64>,
+        /// Slots from now to set end_at (default 150)
+        #[arg(long, default_value_t = 150)]
+        end_offset: u64,
+        /// Override provider pubkey (defaults to ENTROPY_PROVIDER)
+        #[arg(long)]
+        provider: Option<String>,
+    },
+    /// Crank the VAR account (sample and reveal)
+    Crank {
+        /// The address of the VAR account
+        #[arg(short, long, env = "DEFAULT_VAR_ADDRESS")]
+        address: String,
+    },
+    /// Close a VAR account
+    Close {
+        /// The address of the VAR account to close
+        #[arg(short, long, env = "DEFAULT_VAR_ADDRESS")]
+        address: String,
+    },
+    /// Sample the slot hash for a VAR (no reveal)
+    Sample {
+        /// The address of the VAR account
+        #[arg(short, long, env = "DEFAULT_VAR_ADDRESS")]
+        address: String,
+    },
+    /// Advance VAR to next round (sets next end_at = current_slot + offset)
+    Next {
+        /// The address of the VAR account
+        #[arg(short, long, env = "DEFAULT_VAR_ADDRESS")]
+        address: String,
+        /// Slots from now to set end_at (default 150)
+        #[arg(long, default_value_t = 150)]
+        end_offset: u64,
+    },
+    /// Display information about a VAR account
+    Var {
+        /// The address of the VAR account
+        #[arg(short, long, env = "DEFAULT_VAR_ADDRESS")]
+        address: String,
+    },
+    /// End-to-end test: wait -> sample -> fetch seed -> reveal -> verify -> next -> verify
+    Test {
+        /// The address of the VAR account
+        #[arg(short, long, env = "DEFAULT_VAR_ADDRESS")]
+        address: String,
+    },
+}
 
 #[tokio::main]
 async fn main() {
-    // Read keypair from file
-    let payer =
-        read_keypair_file(&std::env::var("KEYPAIR").expect("Missing KEYPAIR env var")).unwrap();
+    // Load .env file if it exists
+    let _ = dotenvy::dotenv();
+    
+    let cli = Cli::parse();
 
-    // Build transaction
-    let rpc = RpcClient::new(std::env::var("RPC").expect("Missing RPC env var"));
-    match std::env::var("COMMAND")
-        .expect("Missing COMMAND env var")
-        .as_str()
-    {
-        "open" => {
-            open(&rpc, &payer).await.unwrap();
+    // Read keypair from file
+    let payer = read_keypair_file(&cli.keypair)
+        .unwrap_or_else(|e| panic!("Failed to read keypair from {}: {}", cli.keypair, e));
+
+    // Build RPC client
+    let rpc = RpcClient::new(cli.rpc);
+
+    let result = match cli.command {
+        Commands::Open {
+            id,
+            commit_hex,
+            samples,
+            end_offset,
+            provider,
+        } => open(&rpc, &payer, id, commit_hex, samples, end_offset, provider).await,
+        Commands::Crank { address } => {
+            let address = Pubkey::from_str(&address).expect("Invalid address");
+            crank(&rpc, &payer, address, &cli.provider_url).await
         }
-        "crank" => {
-            crank(&rpc, &payer).await.unwrap();
+        Commands::Close { address } => {
+            let address = Pubkey::from_str(&address).expect("Invalid address");
+            close(&rpc, &payer, address).await
         }
-        "close" => {
-            close(&rpc, &payer).await.unwrap();
+        Commands::Sample { address } => {
+            let address = Pubkey::from_str(&address).expect("Invalid address");
+            sample_only(&rpc, &payer, address).await
         }
-        "var" => {
-            log_var(&rpc).await.unwrap();
+        Commands::Next { address, end_offset } => {
+            let address = Pubkey::from_str(&address).expect("Invalid address");
+            next_only(&rpc, &payer, address, end_offset).await
         }
-        _ => panic!("Invalid command"),
+        Commands::Var { address } => {
+            let address = Pubkey::from_str(&address).expect("Invalid address");
+            log_var(&rpc, address).await
+        }
+        Commands::Test { address } => {
+            let address = Pubkey::from_str(&address).expect("Invalid address");
+            test_flow(&rpc, &payer, address, &cli.provider_url).await
+        }
     };
+
+    if let Err(e) = result {
+        eprintln!("Error: {}", e);
+        std::process::exit(1);
+    }
 }
 
 async fn close(
     rpc: &RpcClient,
     payer: &solana_sdk::signer::keypair::Keypair,
+    address: Pubkey,
 ) -> Result<(), anyhow::Error> {
-    let address = std::env::var("ADDRESS").unwrap();
-    let address = Pubkey::from_str(&address).expect("Invalid ADDRESS");
     let ix = entropy_api::sdk::close(payer.pubkey(), address);
+    submit_transaction(rpc, payer, &[ix]).await?;
+    Ok(())
+}
+
+async fn next_only(
+    rpc: &RpcClient,
+    payer: &solana_sdk::signer::keypair::Keypair,
+    address: Pubkey,
+    end_offset: u64,
+) -> Result<(), anyhow::Error> {
+    let clock = get_clock(rpc).await?;
+    let end_at = clock.slot + end_offset;
+    let ix = entropy_api::sdk::next(payer.pubkey(), address, end_at);
+    submit_transaction(rpc, payer, &[ix]).await?;
+    println!("Next submitted with end_at={} (offset={})", end_at, end_offset);
+    Ok(())
+}
+
+async fn sample_only(
+    rpc: &RpcClient,
+    payer: &solana_sdk::signer::keypair::Keypair,
+    address: Pubkey,
+) -> Result<(), anyhow::Error> {
+    let ix = entropy_api::sdk::sample(payer.pubkey(), address);
     submit_transaction(rpc, payer, &[ix]).await?;
     Ok(())
 }
@@ -66,34 +197,56 @@ async fn close(
 async fn open(
     rpc: &RpcClient,
     payer: &solana_sdk::signer::keypair::Keypair,
+    id: u64,
+    commit_hex: Option<String>,
+    samples: Option<u64>,
+    end_offset: u64,
+    provider_override: Option<String>,
 ) -> Result<(), anyhow::Error> {
-    let id = std::env::var("ID").unwrap();
-    let id = u64::from_str(&id).expect("Invalid ID");
     let var_address = var_pda(payer.pubkey(), id).0;
     println!("Var address: {:?}", var_address);
-    let commit = keccak::Hash::from_str("9YWL8MgUwgWLF32dHbUwTdTqPWGQjj8mt2A6atayrJC2").unwrap();
+    let commit_bytes: [u8; 32] = if let Some(hex_str) = commit_hex {
+        parse_commit_hex(&hex_str)?
+    } else {
+        anyhow::bail!("commit_hex is required. Please provide --commit-hex parameter.");
+    };
+    let provider_key = if let Some(pk_str) = provider_override {
+        Pubkey::from_str(&pk_str)?
+    } else {
+        ENTROPY_PROVIDER
+    };
     let clock = get_clock(rpc).await?;
+    let end_at = clock.slot + end_offset;
+    let total_samples = samples.unwrap_or(999_998);
     let ix = entropy_api::sdk::open(
         payer.pubkey(),
         payer.pubkey(),
         id,
-        ENTROPY_PROVIDER,
-        commit.to_bytes(),
+        provider_key,
+        commit_bytes,
         false,
-        999_998,
-        clock.slot + 150,
+        total_samples,
+        end_at,
+    );
+    println!(
+        "Opening VAR id={} provider={} samples={} end_at={} commit_hex={}",
+        id,
+        provider_key,
+        total_samples,
+        end_at,
+        to_hex_lower(&commit_bytes)
     );
     submit_transaction(rpc, payer, &[ix]).await?;
+    println!("VAR={}", var_address);
     Ok(())
 }
 
 async fn crank(
     rpc: &RpcClient,
     payer: &solana_sdk::signer::keypair::Keypair,
+    address: Pubkey,
+    provider_url: &str,
 ) -> Result<(), anyhow::Error> {
-    let address = std::env::var("ADDRESS").unwrap();
-    let address = Pubkey::from_str(&address).expect("Invalid ADDRESS");
-
     // Get var.
     let var = get_var(rpc, address).await?;
 
@@ -111,7 +264,7 @@ async fn crank(
     }
 
     // Get the seed from the API
-    let url = format!("https://entropy-api.onrender.com/var/{}/seed", address);
+    let url = format!("{}/var/{}/seed", provider_url.trim_end_matches('/'), address);
     let response = reqwest::get(&url).await?;
     let seed_response: entropy_types::response::GetSeedResponse = response.json().await?;
     println!("Seed: {:?}", seed_response.seed);
@@ -125,9 +278,180 @@ async fn crank(
     Ok(())
 }
 
-async fn log_var(rpc: &RpcClient) -> Result<(), anyhow::Error> {
-    let address = std::env::var("ADDRESS").unwrap();
-    let address = Pubkey::from_str(&address).expect("Invalid ADDRESS");
+fn parse_commit_hex(s: &str) -> Result<[u8; 32], anyhow::Error> {
+    let s = s.trim();
+    let s = s.strip_prefix("0x").unwrap_or(s);
+    if s.len() != 64 {
+        anyhow::bail!("commit hex must be 64 hex chars (32 bytes), got {}", s.len());
+    }
+    let mut out = [0u8; 32];
+    for i in 0..32 {
+        let hi = s.as_bytes()[2 * i] as char;
+        let lo = s.as_bytes()[2 * i + 1] as char;
+        out[i] = (hex_val(hi)? << 4) | hex_val(lo)?;
+    }
+    Ok(out)
+}
+
+fn hex_val(c: char) -> Result<u8, anyhow::Error> {
+    match c {
+        '0'..='9' => Ok((c as u8) - b'0'),
+        'a'..='f' => Ok(10 + (c as u8) - b'a'),
+        'A'..='F' => Ok(10 + (c as u8) - b'A'),
+        _ => anyhow::bail!("invalid hex char '{}'", c),
+    }
+}
+
+fn to_hex_lower(bytes: &[u8]) -> String {
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(hex_digit(b >> 4));
+        s.push(hex_digit(b & 0x0f));
+    }
+    s
+}
+
+fn hex_digit(n: u8) -> char {
+    match n {
+        0..=9 => (b'0' + n) as char,
+        10..=15 => (b'a' + (n - 10)) as char,
+        _ => '?',
+    }
+}
+
+async fn test_flow(
+    rpc: &RpcClient,
+    payer: &solana_sdk::signer::keypair::Keypair,
+    address: Pubkey,
+    provider_url: &str,
+) -> Result<(), anyhow::Error> {
+    use solana_sdk::keccak;
+    use tokio::time::{sleep, Duration};
+
+    // 1) Wait until the var is ready (>= end_at + small buffer)
+    {
+        let buffer_slots = 4;
+        loop {
+            let clock = get_clock(rpc).await?;
+            let var = get_var(rpc, address).await?;
+            if clock.slot >= var.end_at + buffer_slots {
+                println!(
+                    "Ready: current_slot={} end_at={} (buffer={})",
+                    clock.slot, var.end_at, buffer_slots
+                );
+                break;
+            }
+            let remaining = (var.end_at + buffer_slots).saturating_sub(clock.slot);
+            let est_ms = (remaining.max(1) as u64) * 400;
+            let est_s = (est_ms as f64) / 1000.0;
+            println!(
+                "Waiting for readiness... remaining slots: {} (~{:.1}s)",
+                remaining, est_s
+            );
+            sleep(Duration::from_millis(est_ms.min(10_000))).await;
+        }
+    }
+
+    // 2) Submit Sample first
+    {
+        let sample_ix = entropy_api::sdk::sample(payer.pubkey(), address);
+        submit_transaction(rpc, payer, &[sample_ix]).await?;
+        println!("Sample submitted.");
+    }
+
+    // 3) Poll on-chain until slot_hash is recorded
+    {
+        let mut attempts = 0;
+        loop {
+            let var = get_var(rpc, address).await?;
+            if var.slot_hash != [0; 32] {
+                println!("slot_hash recorded.");
+                break;
+            }
+            attempts += 1;
+            if attempts > 20 {
+                anyhow::bail!("slot_hash not recorded after polling");
+            }
+            sleep(Duration::from_millis(400)).await;
+        }
+    }
+
+    // 4) Fetch seed from provider with retry (handles 425 Too Early)
+    let seed_bytes: [u8; 32] = {
+        let url = format!("{}/var/{}/seed", provider_url.trim_end_matches('/'), address);
+        let mut attempts = 0;
+        loop {
+            let resp = reqwest::get(&url).await?;
+            if resp.status().is_success() {
+                let seed_response: entropy_types::response::GetSeedResponse = resp.json().await?;
+                println!("Fetched seed: {:?}", seed_response.seed);
+                break seed_response.seed;
+            } else if resp.status().as_u16() == 425 {
+                attempts += 1;
+                if attempts > 20 {
+                    anyhow::bail!("provider not ready to serve seed after retries");
+                }
+                println!("Provider not ready (425). Retrying...");
+                sleep(Duration::from_millis(400)).await;
+                continue;
+            } else {
+                anyhow::bail!("provider error: {}", resp.status());
+            }
+        }
+    };
+
+    // 5) Submit Reveal
+    {
+        let reveal_ix = entropy_api::sdk::reveal(payer.pubkey(), address, seed_bytes);
+        submit_transaction(rpc, payer, &[reveal_ix]).await?;
+        println!("Reveal submitted.");
+    }
+
+    // 6) Poll until on-chain seed/value are set (finalized)
+    let var_after = {
+        let mut last: Option<Var> = None;
+        let mut attempts = 0;
+        loop {
+            let v = get_var(rpc, address).await?;
+            if v.seed != [0; 32] && v.value != [0; 32] {
+                last = Some(v);
+                break;
+            }
+            attempts += 1;
+            if attempts > 20 {
+                anyhow::bail!("seed/value not recorded after reveal");
+            }
+            sleep(Duration::from_millis(400)).await;
+        }
+        last.unwrap()
+    };
+
+    // 7) Verify on-chain state and computed value
+    if var_after.seed != seed_bytes {
+        anyhow::bail!("on-chain seed does not match revealed seed");
+    }
+    if var_after.slot_hash == [0; 32] {
+        anyhow::bail!("slot_hash was not recorded");
+    }
+    if var_after.value == [0; 32] {
+        anyhow::bail!("value was not finalized");
+    }
+    let commit_from_seed = keccak::hash(&seed_bytes).to_bytes();
+    if commit_from_seed != var_after.commit {
+        anyhow::bail!("commit mismatch: keccak(seed) != on-chain commit");
+    }
+    let expected_value =
+        keccak::hashv(&[&var_after.slot_hash, &var_after.seed, &var_after.samples.to_le_bytes()])
+            .to_bytes();
+    if expected_value != var_after.value {
+        anyhow::bail!("value mismatch: expected != on-chain");
+    }
+    println!("Reveal verified: value matches expected computation.");
+
+    Ok(())
+}
+
+async fn log_var(rpc: &RpcClient, address: Pubkey) -> Result<(), anyhow::Error> {
     let var = get_var(rpc, address).await?;
     print_var(&var);
     Ok(())
